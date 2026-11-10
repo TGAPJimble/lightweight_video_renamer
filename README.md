@@ -9,15 +9,12 @@ It is built for the case where you have dozens or hundreds of unnamed clips (cam
 ## Features
 
 - Fullscreen looping playback powered by [mpv](https://mpv.io) (libmpv), with broad codec and format support
-- Translucent text bar over the video, with the current filename shown at the top
-- In-place renaming: only the name changes, the file extension is always kept
 - Names are made safe for Windows and Linux. Illegal characters become look-alikes (for example `:` becomes `：`), so what you typed is preserved
 - Unicode input supported (accents, CJK, IME)
 - Never overwrites: if the name is taken, ` (1)`, ` (2)` and so on is added
 - Delete moves the file to the Recycle Bin / Trash, after a confirmation pop-up
 - A timestamped log of every rename, skip and delete is written into the folder
 - Native-size view: show the video at its natural resolution, centered
-- Only the top level of the chosen folder is processed. Subfolders are ignored
 
 ## Controls
 
@@ -49,7 +46,7 @@ Run the tests with `pip install pytest` and then `pytest`.
 ## Disclaimer
 
 > [!WARNING]
-> **This is a vibe-coded application.** It was written with AI assistance using **Google Antigravity** and **Claude Sonnet 5.5**, with the author directing the design and testing it by hand rather than hand-writing and reviewing every line. It may contain bugs and has not been audited.
+> **This is a vibe-coded application.** It was written with AI assistance using **Google Antigravity** and **Claude Sonnet 5.5**, with the author directing the design and testing it by hand rather than hand-writing and reviewing every line.
 >
 > Lightweight Video Renamer **renames and deletes files**. Deleted files go to the Recycle Bin / Trash, but renames are not automatically undoable (the log file records old and new names). **Try it on copies of your files first, and keep backups.** It is provided as-is, with no warranty. See [LICENSE](LICENSE).
 
@@ -63,5 +60,3 @@ This project's own code is released under the [MIT License](LICENSE). It relies 
 | [python-mpv](https://github.com/jaseg/python-mpv) | GPLv2+ or LGPLv2.1+ | Python bindings for libmpv |
 | [Send2Trash](https://github.com/arsenetar/send2trash) | BSD-3-Clause | Moving files to the Recycle Bin / Trash |
 | Python / Tkinter | PSF License | Runtime and UI windows |
-
-libmpv is a GPL-licensed binary. If you redistribute it (for example inside a release zip), you take on the GPL's obligations for that binary. This repository deliberately does not include it.
