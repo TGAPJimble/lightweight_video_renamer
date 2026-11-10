@@ -1,0 +1,26 @@
+# libmpv is GPL-licensed and ~116 MB: never commit it. Users fetch it with
+# scripts/install_libmpv.py
+*.dll
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Local scratch and session logs (logs contain real filenames)
+scratch/
+lightweight_video_renamer_*.log
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

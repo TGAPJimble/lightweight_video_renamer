@@ -1,0 +1,12 @@
+[project]
+name = "lightweight-video-renamer"
+version = "0.1.0"
+description = "Rename video files in place while they play (mpv)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = ["python-mpv", "send2trash"]
+
+[project.scripts]
+lightweight-video-renamer = "lightweight_video_renamer.app:main"
