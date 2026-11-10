@@ -1,5 +1,7 @@
 """Tk front-end: fullscreen libmpv video, translucent input bar, delete popup."""
+import argparse
 import os
+import queue
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
@@ -9,12 +11,14 @@ from tkinter import filedialog, messagebox
 if __package__:
     from .actions import rename_file, trash_file
     from .logger import SessionLog
-    from .scanner import scan_videos
+    from .scanner import MODE_IMAGE, MODE_VIDEO, count_other_kind, scan_files
 else:  # run directly: `python app.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from lightweight_video_renamer.actions import rename_file, trash_file
     from lightweight_video_renamer.logger import SessionLog
-    from lightweight_video_renamer.scanner import scan_videos
+    from lightweight_video_renamer.scanner import (
+        MODE_IMAGE, MODE_VIDEO, count_other_kind, scan_files,
+    )
 
 BAR_BG = "#2b2b2b"
 BAR_ALPHA = 0.26          # backdrop opacity
@@ -72,16 +76,19 @@ class OutlinedText:
 
 
 class App:
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, mode: str = MODE_VIDEO):
         self.mpv_mod = _load_mpv()
         self.folder = folder
-        self.files = scan_videos(folder)
+        self.mode = mode
+        self.files = scan_files(folder, mode)
         self.index = 0
         self.counts = {"RENAME": 0, "DELETE": 0, "SKIP": 0, "ERROR": 0}
         self.popup_open = False
         self.busy = False
-        self.native_size = False
-        self.log = SessionLog(folder)
+        self.native_size = True   # native resolution is the default; Alt+Enter toggles fit
+        self._load_token = 0
+        self._events = queue.Queue()
+        self.log = SessionLog(folder, mode)
 
         # Make sure the log file is never treated as a video
         self.root = tk.Tk()
@@ -92,7 +99,7 @@ class App:
         self.sw = self.root.winfo_screenwidth()
         self.sh = self.root.winfo_screenheight()
 
-        self.player = self.mpv_mod.MPV(
+        mpv_opts = dict(
             wid=str(self.root.winfo_id()),
             loop="inf",
             osc=False,
@@ -100,8 +107,32 @@ class App:
             input_vo_keyboard=False,
             keep_open="no",
             idle="yes",
+            video_unscaled="downscale-big",
+            background="color",
+            background_color="#000000",
             log_handler=None,
         )
+        if mode == MODE_IMAGE:
+            mpv_opts["image_display_duration"] = "inf"   # stills stay up until we act
+        self.player = self.mpv_mod.MPV(**mpv_opts)
+
+        @self.player.event_callback("end-file")
+        def _on_end_file(event):
+            # Runs on mpv's thread: only queue; the Tk side polls the queue.
+            try:
+                reason = event.data.reason
+            except AttributeError:
+                reason = None
+            if reason == 4:  # MPV_END_FILE_REASON_ERROR
+                self._events.put("load-error")
+
+        self.conv = None
+        if mode == MODE_IMAGE:
+            if __package__:
+                from .converter import Converter
+            else:
+                from lightweight_video_renamer.converter import Converter
+            self.conv = Converter(self.sw, self.sh)
 
         # mpv's embedded child window doesn't deliver mouse events to us, so a
         # near-invisible full-screen Tk window sits above the video and catches clicks.
@@ -118,6 +149,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.bind("<FocusIn>", lambda e: self.root.after(50, self._focus_entry))
         self.root.after(100, self.load_current)
+        self.root.after(100, self._poll_events)
 
     # ---- UI construction -------------------------------------------------
     def _overlay(self, w, h, x, y, alpha):
@@ -286,27 +318,93 @@ class App:
             self.entry.focus_force()
 
     # ---- playback --------------------------------------------------------
+    def _set_progress(self):
+        prefix = "IMAGES   " if self.mode == MODE_IMAGE else ""
+        self.progress.config(text=f"{prefix}{self.index + 1} / {len(self.files)}")
+
     def load_current(self):
         if self.index >= len(self.files):
             return self.finish()
         p = self.files[self.index]
         self.title_label.config(text=p.name)
-        self.progress.config(text=f"{self.index + 1} / {len(self.files)}")
+        self._set_progress()
         self.entry.delete(0, "end")
         self.redraw_text()
         self.msg.config(text="")
         self.player.pause = False
-        self.player.play(str(p))
+        self._replay(p)
         self.root.after(80, self._focus_entry)
+
+    def _replay(self, p):
+        """(Re)display file p: directly in mpv, or via the converter for HEIC/RAW/SVG..."""
+        self._load_token += 1
+        token = self._load_token
+        if self.conv is None or not self._needs_conversion(p):
+            self.player.play(str(p))
+            self._preload_next()
+            return
+        self._poll_conversion(p, self.conv.request(p), token, 0)
+
+    @staticmethod
+    def _needs_conversion(p):
+        if __package__:
+            from .converter import kind_of
+        else:
+            from lightweight_video_renamer.converter import kind_of
+        return kind_of(p) is not None
+
+    def _poll_conversion(self, p, fut, token, waited):
+        if token != self._load_token:
+            return  # a newer file was requested meanwhile
+        if not fut.done():
+            if waited >= 5:  # only show "Loading" if it is actually slow
+                self.msg.config(text="Loading...")
+            self.root.after(30, self._poll_conversion, p, fut, token, waited + 1)
+            return
+        self.msg.config(text="")
+        err = fut.exception()
+        if err is not None:
+            self.player.command("stop")
+            self.counts["ERROR"] += 1
+            self.log.write("ERROR", f"{p.name}\tcannot display: {err!r}")
+            self.msg.config(text=f"Can't display this file ({err}). You can still rename, skip or delete it.")
+        else:
+            self.player.play(str(fut.result()))
+        self._preload_next()
+
+    def _preload_next(self):
+        if self.conv is None:
+            return
+        nxt = self.index + 1
+        if nxt < len(self.files) and self._needs_conversion(self.files[nxt]):
+            self.conv.request(self.files[nxt])
+
+    def _poll_events(self):
+        try:
+            while True:
+                if self._events.get_nowait() == "load-error":
+                    if self.index < len(self.files):
+                        name = self.files[self.index].name
+                        self.counts["ERROR"] += 1
+                        self.log.write("ERROR", f"{name}\tmpv could not load this file")
+                        self.msg.config(text="Can't display this file. You can still rename, skip or delete it.")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
 
     def release_current(self):
         """Make mpv let go of the file so it can be renamed/deleted."""
         self.player.command("stop")
         self.root.update()
+        if self.conv is not None and self.index < len(self.files):
+            self.conv.release(self.files[self.index])
 
     def advance(self):
+        old = self.files[self.index] if self.index < len(self.files) else None
         self.index += 1
         self.load_current()
+        if self.conv is not None and old is not None:
+            self.root.after(500, self.conv.release, old)  # tidy the old temp file
 
     # ---- actions ---------------------------------------------------------
     def on_enter(self, _e=None):
@@ -325,7 +423,7 @@ class App:
             new, note = rename_file(src, typed)
             if new is None:
                 self.msg.config(text="That name isn't usable - try again")
-                self.player.play(str(src))
+                self._replay(src)
                 return "break"
             if note == "unchanged":
                 self.counts["SKIP"] += 1
@@ -338,7 +436,7 @@ class App:
             self.counts["ERROR"] += 1
             self.log.write("ERROR", f"{src.name}\t{ex!r}")
             self.msg.config(text=f"Rename failed: {ex}")
-            self.player.play(str(src))
+            self._replay(src)
         finally:
             self.busy = False
         return "break"
@@ -394,7 +492,7 @@ class App:
             self.log.write("ERROR", f"{src.name}\tdelete: {ex!r}")
             self.msg.config(text=f"Delete failed: {ex}")
             self.player.pause = False
-            self.player.play(str(src))
+            self._replay(src)
         finally:
             self.busy = False
         return "break"
@@ -414,13 +512,18 @@ class App:
             try:
                 self.player.terminate()
             finally:
+                if self.conv is not None:
+                    self.conv.cleanup()
                 self.root.destroy()
 
     def run(self):
         if not self.files:
-            self.log.close("no video files")
-            messagebox.showinfo("Lightweight Video Renamer", "No video files found in that folder.")
+            self.log.close("no files")
+            messagebox.showinfo("Lightweight Video Renamer",
+                                _no_files_message(self.folder, self.mode))
             self.player.terminate()
+            if self.conv is not None:
+                self.conv.cleanup()
             self.root.destroy()
             return
         self.root.mainloop()
@@ -441,21 +544,60 @@ def _enable_dpi_awareness():
             pass
 
 
+def _no_files_message(folder: Path, mode: str) -> str:
+    kind, other_kind = ("images", "videos") if mode == MODE_IMAGE else ("videos", "images")
+    msg = f"No {kind} found in that folder."
+    other = count_other_kind(folder, mode)
+    if other:
+        hint = "without" if mode == MODE_IMAGE else "with"
+        msg += (f"\n\nIt contains {other} {other_kind}. Run {hint} --images to "
+                f"rename those instead.")
+    return msg
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        prog="lightweight_video_renamer",
+        description="Rename videos (default) or images (--images) while they display.",
+    )
+    parser.add_argument("folder", nargs="?", help="folder to process (default: choose one)")
+    parser.add_argument("--images", action="store_true",
+                        help="image mode: images, GIFs, HEIC, RAW and SVG instead of videos")
+    args = parser.parse_args()
+    mode = MODE_IMAGE if args.images else MODE_VIDEO
+
+    if mode == MODE_IMAGE:
+        try:
+            if __package__:
+                from .converter import check_dependencies
+            else:
+                from lightweight_video_renamer.converter import check_dependencies
+            check_dependencies()
+        except ImportError as e:
+            sys.exit(str(e))
+
     _enable_dpi_awareness()
-    if len(sys.argv) > 1:
-        folder = Path(sys.argv[1])
+    if args.folder:
+        folder = Path(args.folder)
     else:
         picker = tk.Tk()
         picker.withdraw()
-        chosen = filedialog.askdirectory(title="Select a folder of videos")
+        chosen = filedialog.askdirectory(
+            title="Select a folder of images" if mode == MODE_IMAGE
+            else "Select a folder of videos")
         picker.destroy()
         if not chosen:
             return
         folder = Path(chosen)
     if not folder.is_dir():
         sys.exit(f"Not a folder: {folder}")
-    App(folder).run()
+    if not scan_files(folder, mode):
+        box = tk.Tk()
+        box.withdraw()
+        messagebox.showinfo("Lightweight Video Renamer", _no_files_message(folder, mode))
+        box.destroy()
+        return
+    App(folder, mode).run()
 
 
 if __name__ == "__main__":

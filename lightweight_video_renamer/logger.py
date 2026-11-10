@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 class SessionLog:
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, mode: str = "video"):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = Path(folder) / f"lightweight_video_renamer_{stamp}.log"
         n = 1
@@ -12,7 +12,7 @@ class SessionLog:
             self.path = Path(folder) / f"lightweight_video_renamer_{stamp}_{n}.log"
             n += 1
         self._f = open(self.path, "w", encoding="utf-8")
-        self.write("START", f"folder={folder}")
+        self.write("START", f"folder={folder}\tmode={mode}")
 
     def write(self, action: str, detail: str = "") -> None:
         ts = datetime.now().isoformat(timespec="seconds")
