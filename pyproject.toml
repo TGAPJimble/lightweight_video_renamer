@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "lightweight-video-renamer"
 version = "0.2.0"
@@ -15,5 +19,13 @@ dependencies = [
     "resvg-py",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 lightweight-video-renamer = "lightweight_video_renamer.app:main"
+
+[tool.setuptools.packages.find]
+include = ["lightweight_video_renamer*"]

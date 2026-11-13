@@ -58,18 +58,73 @@ A log named `lightweight_video_renamer_YYYYMMDD_HHMMSS.log` is written into the 
 
 ## Setup
 
-Requires Python 3.9 or later.
+> [!NOTE]
+> **Platform Support:** This application has only been tested on **Windows** and **Arch Linux**. Requires Python 3.9 or later.
 
-```powershell
-pip install python-mpv send2trash pillow pillow-heif rawpy resvg-py
-python scripts/install_libmpv.py                        # Windows: downloads libmpv (mpv-2.dll) into lightweight_video_renamer/
-python -m lightweight_video_renamer [folder]            # Video mode (omit folder to open the folder picker)
-python -m lightweight_video_renamer --images [folder]   # Image mode (omit folder to open the folder picker)
-```
+### Arch Linux (Step-by-Step)
 
-On Linux, install libmpv with your package manager (for example `apt install libmpv2`) instead of running the script.
+1. **Clone the repository and enter the project folder:**
+   ```bash
+   git clone <repo-url>
+   cd lightweight_video_renamer
+   ```
 
-Run the tests with `pip install pytest` and then `pytest`.
+2. **Run the Arch Linux dependency setup script:**
+   ```bash
+   ./scripts/setup_arch.sh
+   ```
+   This script:
+   - Checks for required system packages (`python`, `tk`, `mpv`, `libheif`, `libraw`) via `pacman` and installs any missing packages with `sudo pacman -S --needed`.
+   - Creates a local Python virtual environment at `.venv/` (respecting Arch's PEP 668 externally-managed Python environment).
+   - Installs `lightweight-video-renamer` in editable mode along with all Python dependencies (`python-mpv`, `send2trash`, `pillow`, `pillow-heif`, `rawpy`, `resvg-py`) and `pytest`.
+   - Verifies that `libmpv`, `tkinter`, and all Python modules import cleanly.
+
+3. **Activate the virtual environment and run the app:**
+   ```bash
+   source .venv/bin/activate
+   lightweight-video-renamer [folder]            # Video mode (omit folder to open the folder picker)
+   lightweight-video-renamer --images [folder]   # Image mode (omit folder to open the folder picker)
+   ```
+   *(Alternatively, run `.venv/bin/lightweight-video-renamer` directly without activating the virtual environment.)*
+
+### Windows (Step-by-Step)
+
+1. **Install Python 3.9+** (with `tkinter` included, which is enabled by default in the official Windows Python installer).
+
+2. **Clone the repository and open a PowerShell terminal in the project folder:**
+   ```powershell
+   git clone <repo-url>
+   cd lightweight_video_renamer
+   ```
+
+3. **Install the Python dependencies:**
+   ```powershell
+   pip install python-mpv send2trash pillow pillow-heif rawpy resvg-py
+   ```
+
+4. **Download `libmpv` (`mpv-2.dll`):**
+   ```powershell
+   python scripts/install_libmpv.py
+   ```
+   This fetches the latest `mpv-dev` release from [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) and places `mpv-2.dll` inside `lightweight_video_renamer/`.
+
+5. **Run the app:**
+   ```powershell
+   python -m lightweight_video_renamer [folder]            # Video mode (omit folder to open the folder picker)
+   python -m lightweight_video_renamer --images [folder]   # Image mode (omit folder to open the folder picker)
+   ```
+
+### Running Tests
+
+- **Arch Linux:**
+  ```bash
+  .venv/bin/pytest
+  ```
+- **Windows:**
+  ```powershell
+  pip install pytest
+  pytest
+  ```
 
 ## Disclaimer
 
@@ -84,7 +139,7 @@ This project's own code is released under the [MIT License](LICENSE). It relies 
 
 | Project | License | Use |
 |---|---|---|
-| [mpv / libmpv](https://mpv.io) | GPL (build-dependent) | Video and image display. Downloaded separately by `scripts/install_libmpv.py` from [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) |
+| [mpv / libmpv](https://mpv.io) | GPL (build-dependent) | Video and image display. Installed via `pacman` (`scripts/setup_arch.sh`) on Arch Linux, or downloaded separately by `scripts/install_libmpv.py` from [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) on Windows |
 | [python-mpv](https://github.com/jaseg/python-mpv) | GPLv2+ or LGPLv2.1+ | Python bindings for libmpv |
 | [Send2Trash](https://github.com/arsenetar/send2trash) | BSD-3-Clause | Moving files to the Recycle Bin / Trash |
 | [Pillow](https://python-pillow.org) | MIT-CMU | Image decoding, EXIF orientation, and temporary preview encoding |

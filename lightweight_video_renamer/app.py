@@ -1,8 +1,12 @@
 """Tk front-end: fullscreen libmpv video, translucent input bar, delete popup."""
 import argparse
+import locale
 import os
 import queue
+import re
+import subprocess
 import sys
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -75,6 +79,49 @@ class OutlinedText:
                       anchor=self.anchor, font=self.font, tags=self.tag)
 
 
+class _OsdField:
+    """Label-like proxy that stores text on App and triggers an mpv OSD update."""
+
+    def __init__(self, app, attr: str):
+        self.app = app
+        self.attr = attr
+
+    def config(self, text: str = ""):
+        setattr(self.app, self.attr, text)
+        self.app._render_osd()
+
+
+def _ass_escape(text: str) -> str:
+    """Escape arbitrary text for mpv's ass-events OSD overlay."""
+    if not text:
+        return ""
+    # Prevent libass from interpreting backslash sequences or override blocks
+    out = text.replace("\\", "\\\u2060")
+    out = out.replace("{", "\\{").replace("}", "\\}")
+    out = out.replace("\n", "\\N")
+    out = out.replace(" ", "\\h")
+    return out
+
+
+def _detect_linux_monitor_size(root: tk.Tk) -> tuple[int, int]:
+    """Return the active monitor's (width, height) rather than the combined multi-monitor desktop."""
+    w, h = root.winfo_width(), root.winfo_height()
+    if w > 200 and h > 200:
+        return w, h
+    try:
+        out = subprocess.check_output(
+            ["xrandr", "--listmonitors"], stderr=subprocess.DEVNULL, text=True, timeout=1.0
+        )
+        # Prefer primary monitor (+*name), otherwise first active monitor
+        for pattern in (r"\+\*\S+\s+(\d+)/\d+x(\d+)/\d+", r"\+\S+\s+(\d+)/\d+x(\d+)/\d+"):
+            m = re.search(pattern, out)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    except Exception:  # noqa: BLE001
+        pass
+    return root.winfo_screenwidth(), root.winfo_screenheight()
+
+
 class App:
     def __init__(self, folder: Path, mode: str = MODE_VIDEO):
         self.mpv_mod = _load_mpv()
@@ -88,16 +135,38 @@ class App:
         self.native_size = True   # native resolution is the default; Alt+Enter toggles fit
         self._load_token = 0
         self._events = queue.Queue()
+        self._last_click_ts = 0.0
+        self.use_mpv_osd = os.name != "nt"
+        self.title_text = ""
+        self.progress_text = ""
+        self.msg_text = ""
+        self.delete_target_name = ""
         self.log = SessionLog(folder, mode)
 
         # Make sure the log file is never treated as a video
         self.root = tk.Tk()
+        if os.name != "nt":
+            # Tk's Tcl_Init sets LC_NUMERIC from the environment; libmpv requires "C".
+            locale.setlocale(locale.LC_NUMERIC, "C")
         self.root.configure(bg="black")
-        self.root.attributes("-fullscreen", True)
         self.root.title("Lightweight Video Renamer")
+        self.root.attributes("-fullscreen", True)
         self.root.update_idletasks()
-        self.sw = self.root.winfo_screenwidth()
-        self.sh = self.root.winfo_screenheight()
+        if self.use_mpv_osd:
+            self.root.deiconify()
+            try:
+                self.root.wait_visibility(self.root)
+            except tk.TclError:
+                pass
+            for _ in range(25):
+                self.root.update()
+                if self.root.winfo_width() > 200 and self.root.winfo_height() > 200:
+                    break
+                time.sleep(0.01)
+            self.sw, self.sh = _detect_linux_monitor_size(self.root)
+        else:
+            self.sw = self.root.winfo_screenwidth()
+            self.sh = self.root.winfo_screenheight()
 
         mpv_opts = dict(
             wid=str(self.root.winfo_id()),
@@ -112,6 +181,16 @@ class App:
             background_color="#000000",
             log_handler=None,
         )
+        if self.use_mpv_osd:
+            # Force X11/EGL embedding into Tk's X11 window (prevents mpv from spawning
+            # a separate native Wayland window) and pass mouse clicks through to Tk.
+            mpv_opts.update(
+                vo="gpu,x11",
+                gpu_context="x11egl",
+                input_cursor=False,
+                cursor_autohide="no",
+                force_window="immediate",
+            )
         if mode == MODE_IMAGE:
             mpv_opts["image_display_duration"] = "inf"   # stills stay up until we act
         self.player = self.mpv_mod.MPV(**mpv_opts)
@@ -134,24 +213,191 @@ class App:
                 from lightweight_video_renamer.converter import Converter
             self.conv = Converter(self.sw, self.sh)
 
-        # mpv's embedded child window doesn't deliver mouse events to us, so a
-        # near-invisible full-screen Tk window sits above the video and catches clicks.
-        self.catcher = tk.Toplevel(self.root)
-        self.catcher.overrideredirect(True)
-        self.catcher.attributes("-topmost", True)
-        self.catcher.attributes("-alpha", 0.01)
-        self.catcher.configure(bg="black", cursor="arrow")
-        self.catcher.geometry(f"{self.sw}x{self.sh}+0+0")
-        self.catcher.bind("<Button-1>", self.on_click)
+        if self.use_mpv_osd:
+            self._build_linux_ui()
+        else:
+            # mpv's embedded child window doesn't deliver mouse events to us on Windows,
+            # so a near-invisible full-screen Tk window sits above the video and catches clicks.
+            self.catcher = tk.Toplevel(self.root)
+            self.catcher.overrideredirect(True)
+            self.catcher.attributes("-topmost", True)
+            self.catcher.attributes("-alpha", 0.01)
+            self.catcher.configure(bg="black", cursor="arrow")
+            self.catcher.geometry(f"{self.sw}x{self.sh}+0+0")
+            self.catcher.bind("<Button-1>", self.on_click)
 
-        self._build_title()
-        self._build_bar()
+            self._build_title()
+            self._build_bar()
+
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.root.bind("<FocusIn>", lambda e: self.root.after(50, self._focus_entry))
         self.root.after(100, self.load_current)
         self.root.after(100, self._poll_events)
 
     # ---- UI construction -------------------------------------------------
+    def _build_linux_ui(self):
+        """Single-window Linux setup: hidden Entry in root + GPU osd-overlay in mpv."""
+        self.title_label = _OsdField(self, "title_text")
+        self.progress = _OsdField(self, "progress_text")
+        self.msg = _OsdField(self, "msg_text")
+
+        self.font = tkfont.Font(family=FONT[0], size=FONT[1], weight="bold")
+        self._update_bar_metrics()
+
+        self.entry = tk.Entry(
+            self.root, font=FONT, bg="black", fg="black", insertbackground="black",
+            relief="flat", highlightthickness=0, borderwidth=0,
+        )
+        self.entry.place(x=0, y=0, width=2, height=2)
+        self.cursor_on = True
+        self._last_state = None
+        self._redraw_pending = False
+
+        self.entry.bind("<KeyPress>", lambda e: self.schedule_redraw())
+        self.entry.bind("<KeyRelease>", lambda e: self.schedule_redraw())
+        self.entry.bind("<ButtonRelease>", lambda e: self.schedule_redraw())
+        self.entry.bind("<<Paste>>", lambda e: self.schedule_redraw())
+
+        for w_ in (self.entry, self.root):
+            w_.bind("<Return>", self.on_enter)
+            w_.bind("<KP_Enter>", self.on_enter)
+            w_.bind("<Escape>", self.on_escape)
+            w_.bind("<Delete>", self.on_delete_key)
+            w_.bind("<Alt-Return>", self.toggle_native_size)
+            w_.bind("<Alt-KP_Enter>", self.toggle_native_size)
+            w_.bind("<Mod1-Return>", self.toggle_native_size)
+            w_.bind("<Mod1-KP_Enter>", self.toggle_native_size)
+
+        self.root.bind("<KeyPress>", self._on_root_key)
+        self.root.bind("<Button-1>", self.on_click)
+        self.root.bind("<Configure>", self._on_root_configure)
+
+        try:
+            @self.player.on_key_press("MBTN_LEFT")
+            def _mpv_left_click():
+                self._events.put("click")
+        except Exception:  # noqa: BLE001
+            pass
+
+        self.redraw_text()
+
+    def _update_bar_metrics(self):
+        text_abs = int(self.sw * TEXT_START)
+        x = text_abs - BAR_PAD_LEFT
+        w = self.sw - 2 * x
+        self.text_x = BAR_PAD_LEFT
+        self.text_w = max(100, w - BAR_PAD_LEFT - 30)
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root:
+            return
+        if event.width > 200 and event.height > 200:
+            if (event.width, event.height) != (self.sw, self.sh):
+                self.sw, self.sh = event.width, event.height
+                self._update_bar_metrics()
+                if self.conv is not None:
+                    self.conv.screen_w, self.conv.screen_h = self.sw, self.sh
+                self._render_osd()
+
+    def _on_root_key(self, event):
+        if self.popup_open or self.busy or str(self.entry.cget("state")) == "disabled":
+            return
+        if self.root.focus_get() is not self.entry:
+            self.entry.focus_set()
+            if event.keysym == "BackSpace":
+                idx = self.entry.index("insert")
+                if idx > 0:
+                    self.entry.delete(idx - 1, idx)
+                self.schedule_redraw()
+            elif event.char and event.char.isprintable() and not (event.state & 0xC):
+                self.entry.insert("insert", event.char)
+                self.schedule_redraw()
+
+    def _render_osd(self):
+        if not self.use_mpv_osd:
+            return
+        sw, sh = max(320, self.sw), max(240, self.sh)
+        h = 130
+        text_abs = int(sw * TEXT_START)
+        x = text_abs - BAR_PAD_LEFT
+        w = sw - 2 * x
+        y = sh - h - 60
+
+        lines = []
+        # 1. Top filename header & progress
+        if self.title_text:
+            lines.append(
+                f"{{\\an5\\pos({sw // 2},50)\\fnsans-serif\\b1\\fs36\\bord2.5\\shad0"
+                f"\\1c&HFFFFFF&\\3c&H000000&}}{_ass_escape(self.title_text)}"
+            )
+        if self.progress_text:
+            lines.append(
+                f"{{\\an6\\pos({sw - 24},28)\\fnsans-serif\\b1\\fs20\\bord2\\shad0"
+                f"\\1c&HD0D0D0&\\3c&H000000&}}{_ass_escape(self.progress_text)}"
+            )
+
+        # 2. Bottom translucent input bar backdrop (#2b2b2b at 0.26 opacity -> alpha 0xBD)
+        lines.append(
+            f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H2B2B2B&\\1a&HBD&}}"
+            f"m {x} {y} l {x + w} {y} {x + w} {y + h} {x} {y + h}{{\\p0}}"
+        )
+
+        # 3. Error / status line inside the bar
+        if self.msg_text:
+            lines.append(
+                f"{{\\an7\\pos({x + BAR_PAD_LEFT},{y + 10})\\fnsans-serif\\b0\\fs17\\bord1.5\\shad0"
+                f"\\1c&H9D9DFF&\\3c&H000000&}}{_ass_escape(self.msg_text)}"
+            )
+
+        # 4. Typed text
+        text = self.entry.get()
+        if text:
+            idx = self.entry.index("insert")
+            caret_px = self.font.measure(text[:idx])
+            shift = max(0, caret_px - self.text_w + 20)
+            tx = x + BAR_PAD_LEFT - shift
+            ty = y + 30 + (h - 30) // 2
+            lines.append(
+                f"{{\\an4\\pos({tx},{ty})\\clip({x + 10},{y + 25},{x + w - 15},{y + h})"
+                f"\\fnsans-serif\\b1\\fs46\\bord2.5\\shad0\\1c&HFFFFFF&\\3c&H000000&}}"
+                f"{_ass_escape(text)}"
+            )
+
+        # 5. Delete confirmation popup modal
+        if self.popup_open:
+            pw, ph = int(sw * 0.5), 190
+            px, py = (sw - pw) // 2, (sh - ph) // 2
+            lines.append(
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H2B2B2B&\\1a&H14&}}"
+                f"m {px} {py} l {px + pw} {py} {px + pw} {py + ph} {px} {py + ph}{{\\p0}}"
+            )
+            lines.append(
+                f"{{\\an7\\pos(0,0)\\p1\\bord0\\shad0\\1c&H4F53D9&\\1a&H00&}}"
+                f"m {px} {py} l {px + pw} {py} {px + pw} {py + 6} {px} {py + 6}{{\\p0}}"
+            )
+            lines.append(
+                f"{{\\an5\\pos({sw // 2},{py + 46})\\fnsans-serif\\b1\\fs30\\bord0\\shad0"
+                f"\\1c&HFFFFFF&}}Move to Recycle Bin?"
+            )
+            lines.append(
+                f"{{\\an5\\pos({sw // 2},{py + 96})"
+                f"\\clip({px + 20},{py + 70},{px + pw - 20},{py + 125})"
+                f"\\fnsans-serif\\b0\\fs20\\bord0\\shad0\\1c&HDDDDDD&}}"
+                f"{_ass_escape(self.delete_target_name)}"
+            )
+            lines.append(
+                f"{{\\an5\\pos({sw // 2},{py + 150})\\fnsans-serif\\b0\\fs17\\bord0\\shad0"
+                f"\\1c&HAAAAAA&}}Enter = delete\\h\\h\\h\\h\\h\\hEsc = cancel"
+            )
+
+        try:
+            self.player.command(
+                "osd-overlay", id=1, format="ass-events",
+                data="\n".join(lines), res_x=sw, res_y=sh,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def _overlay(self, w, h, x, y, alpha):
         t = tk.Toplevel(self.root)
         t.overrideredirect(True)
@@ -269,6 +515,9 @@ class App:
         self.redraw_text()
 
     def redraw_text(self):
+        if self.use_mpv_osd:
+            self._render_osd()
+            return
         c = self.canvas
         text = self.entry.get()
         idx = self.entry.index("insert")
@@ -306,6 +555,10 @@ class App:
 
     def on_click(self, _e=None):
         """Left click anywhere toggles pause (not during delete popup / file operations)."""
+        now = time.monotonic()
+        if now - self._last_click_ts < 0.08:
+            return "break"
+        self._last_click_ts = now
         if not self.popup_open and not self.busy:
             self.player.pause = not self.player.pause
         self.root.after(10, self._focus_entry)  # keep typing focus on the hidden entry
@@ -313,9 +566,12 @@ class App:
 
     def _focus_entry(self):
         if not self.popup_open:
-            self.backdrop.lift()
-            self.bar.lift()
-            self.entry.focus_force()
+            if self.use_mpv_osd:
+                self.entry.focus_set()
+            else:
+                self.backdrop.lift()
+                self.bar.lift()
+                self.entry.focus_force()
 
     # ---- playback --------------------------------------------------------
     def _set_progress(self):
@@ -326,6 +582,7 @@ class App:
         if self.index >= len(self.files):
             return self.finish()
         p = self.files[self.index]
+        self.entry.config(state="normal")
         self.title_label.config(text=p.name)
         self._set_progress()
         self.entry.delete(0, "end")
@@ -382,12 +639,15 @@ class App:
     def _poll_events(self):
         try:
             while True:
-                if self._events.get_nowait() == "load-error":
+                ev = self._events.get_nowait()
+                if ev == "load-error":
                     if self.index < len(self.files):
                         name = self.files[self.index].name
                         self.counts["ERROR"] += 1
                         self.log.write("ERROR", f"{name}\tmpv could not load this file")
                         self.msg.config(text="Can't display this file. You can still rename, skip or delete it.")
+                elif ev == "click":
+                    self.on_click()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -407,8 +667,19 @@ class App:
             self.root.after(500, self.conv.release, old)  # tidy the old temp file
 
     # ---- actions ---------------------------------------------------------
-    def on_enter(self, _e=None):
-        if self.busy or self.popup_open or self.index >= len(self.files):
+    def on_escape(self, _e=None):
+        if self.popup_open:
+            return self.cancel_delete()
+        self.quit()
+        return "break"
+
+    def on_enter(self, event=None):
+        # On Linux/X11, Alt+Enter may arrive at the <Return> binding with Mod1Mask (0x8)
+        if event is not None and (event.state & 0x8 or event.state & 0x20000):
+            return self.toggle_native_size(event)
+        if self.popup_open:
+            return self.confirm_delete()
+        if self.busy or self.index >= len(self.files):
             return "break"
         typed = self.entry.get().strip()
         src = self.files[self.index]
@@ -452,6 +723,11 @@ class App:
         self.popup_open = True
         self.player.pause = True
         src = self.files[self.index]
+        self.delete_target_name = src.name
+        if self.use_mpv_osd:
+            self.entry.config(state="disabled")
+            self._render_osd()
+            return
         w, h = int(self.sw * 0.5), 190
         x, y = (self.sw - w) // 2, (self.sh - h) // 2
         pop = self._overlay(w, h, x, y, 0.92)
@@ -470,6 +746,13 @@ class App:
         pop.focus_force()
 
     def cancel_delete(self, _e=None):
+        if self.use_mpv_osd:
+            self.popup_open = False
+            self.entry.config(state="normal")
+            self.player.pause = False
+            self._render_osd()
+            self.root.after(30, self._focus_entry)
+            return "break"
         self.popup.destroy()
         self.popup_open = False
         self.player.pause = False
@@ -478,8 +761,13 @@ class App:
 
     def confirm_delete(self, _e=None):
         src = self.files[self.index]
-        self.popup.destroy()
-        self.popup_open = False
+        if self.use_mpv_osd:
+            self.popup_open = False
+            self.entry.config(state="normal")
+            self._render_osd()
+        else:
+            self.popup.destroy()
+            self.popup_open = False
         self.busy = True
         try:
             self.release_current()
@@ -503,6 +791,7 @@ class App:
         self.title_label.config(text="All done - press Esc to exit")
         self.progress.config(text="")
         self.player.command("stop")
+        self.redraw_text()
 
     def quit(self):
         summary = " ".join(f"{k.lower()}={v}" for k, v in self.counts.items())

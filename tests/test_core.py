@@ -72,6 +72,8 @@ def test_converter_heic_and_svg(tmp_path: Path):
         encoding="utf-8",
     )
     heic = tmp_path / "photo.heic"
+    import pillow_heif
+    pillow_heif.register_heif_opener()
     Image.new("RGB", (320, 240), (180, 40, 40)).save(heic)
 
     conv = Converter(screen_w=2000, screen_h=1200)
@@ -109,3 +111,11 @@ def test_rename_sanitizes(tmp_path: Path):
     new, note = rename_file(a, "what? 12:30")
     assert new.name == "what？ 12：30.mp4"
     assert new.exists() and not a.exists()
+
+
+def test_ass_escape():
+    from lightweight_video_renamer.app import _ass_escape
+    escaped = _ass_escape("clip {1} \\N test")
+    assert "\\{" in escaped and "\\}" in escaped
+    assert "\\h" in escaped
+    assert "\\N" not in escaped
